@@ -8,7 +8,7 @@ bot = telebot.TeleBot(os.getenv('BOT_TOKEN'))
 # Функция, обрабатывающая команду /start
 @bot.message_handler(commands=["start"])
 def start(m, res=False):
-    bot.send_message(m.chat.id, 'Я тут. Напиши что-либо за ради теста!'')
+    bot.send_message(m.chat.id, 'Я тут. Напиши что-либо за ради теста!')
 # Получение сообщений от юзера
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
