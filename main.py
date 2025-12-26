@@ -1,92 +1,109 @@
 import telebot
 import os
-import json
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timedelta
 from telebot import types
 
 bot = telebot.TeleBot(os.getenv('BOT_TOKEN'))
 ADMIN_ID = 6337781618
 
-# Хранилище данных
-questions = {}  # Активные вопросы: {номер: {данные}}
-answered = []   # Отвеченные вопросы: [{данные}]
+# Хранилище
+questions = {}
+active_chats = {}  # {user_id: admin_id} - активные переписки
 question_counter = 1
+banned_users = set()  # ID заблокированных пользователей
 
-# Файл для сохранения истории
-DATA_FILE = "bot_history.json"
+# ===== ТАЙМЕР ДЛЯ ПЕРЕПИСКИ =====
+def chat_timeout_checker():
+    """Проверяет неактивные переписки каждую минуту"""
+    while True:
+        try:
+            to_remove = []
+            for user_id, chat_data in list(active_chats.items()):
+                if datetime.now() - chat_data['last_activity'] > timedelta(minutes=5):
+                    # Уведомляем обоих
+                    bot.send_message(user_id, "⏰ Переписка завершена (неактивность 5 минут)")
+                    bot.send_message(chat_data['admin_id'], f"⏰ Переписка с {chat_data['username']} завершена")
+                    to_remove.append(user_id)
+            
+            for user_id in to_remove:
+                del active_chats[user_id]
+                
+        except:
+            pass
+        time.sleep(60)  # Проверка раз в минуту
 
-# ===== ЗАГРУЗКА/СОХРАНЕНИЕ =====
-def load_data():
-    global questions, answered, question_counter
-    try:
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            questions = data.get("questions", {})
-            answered = data.get("answered", [])
-            question_counter = data.get("counter", 1)
-    except:
-        pass
-
-def save_data():
-    data = {
-        "questions": questions,
-        "answered": answered,
-        "counter": question_counter
-    }
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-load_data()
+# Запускаем таймер в отдельном потоке
+timer_thread = threading.Thread(target=chat_timeout_checker, daemon=True)
+timer_thread.start()
 
 # ===== ДЛЯ ПОЛЬЗОВАТЕЛЕЙ =====
 @bot.message_handler(commands=['start'])
 def start(message):
+    if message.from_user.id in banned_users:
+        bot.send_message(message.chat.id, "🚫 Вы заблокированы")
+        return
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton('📨 Задать вопрос'),
+        types.KeyboardButton('💬 Прямая переписка')
+    )
+    bot.send_message(message.chat.id, "Выберите:", reply_markup=markup)
+
+@bot.message_handler(func=lambda m: m.text in ['📨 Задать вопрос', '💬 Прямая переписка'] and m.from_user.id not in banned_users)
+def handle_user_buttons(message):
+    if message.text == '📨 Задать вопрос':
+        msg = bot.send_message(message.chat.id, "Напишите вопрос:", reply_markup=types.ReplyKeyboardRemove())
+        bot.register_next_step_handler(msg, save_question)
+    elif message.text == '💬 Прямая переписка':
+        request_direct_chat(message)
+
+def request_direct_chat(message):
+    global question_counter
+    user = message.from_user
+    username = f"@{user.username}" if user.username else user.first_name
+    
+    questions[question_counter] = {
+        'user_id': message.chat.id,
+        'username': username,
+        'type': 'chat'
+    }
+    
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton('📨 Задать вопрос', callback_data='ask'))
+    markup.add(types.InlineKeyboardButton('✅ Принять', callback_data=f'accept_{question_counter}'))
+    
     bot.send_message(
-        message.chat.id,
-        f"Привет! Нажми кнопку ниже, чтобы задать вопрос.",
+        ADMIN_ID,
+        f"💬 *Запрос на переписку #{question_counter}*\nОт: {username} (`{message.chat.id}`)",
+        parse_mode='Markdown',
         reply_markup=markup
     )
-
-@bot.callback_query_handler(func=lambda call: call.data == 'ask')
-def ask_question(call):
-    msg = bot.send_message(call.message.chat.id, "Напишите ваш вопрос:")
-    bot.register_next_step_handler(msg, save_question)
+    
+    bot.send_message(message.chat.id, "✅ Запрос отправлен!")
+    question_counter += 1
 
 def save_question(message):
     global question_counter
     user = message.from_user
     username = f"@{user.username}" if user.username else user.first_name
     
-    # Сохраняем с временем
-    question_data = {
-        'number': question_counter,
+    questions[question_counter] = {
         'user_id': message.chat.id,
         'username': username,
         'text': message.text,
-        'asked_time': datetime.now().strftime("%d.%m %H:%M"),
-        'answered': False,
-        'answer_text': None,
-        'answered_time': None
+        'type': 'question'
     }
     
-    questions[question_counter] = question_data
-    
-    # Уведомление админу
     bot.send_message(
         ADMIN_ID,
-        f"📨 *Новый вопрос #{question_counter}*\n"
-        f"От: {username} (`{message.chat.id}`)\n"
-        f"Время: {question_data['asked_time']}\n"
-        f"Текст: {message.text}\n\n"
-        f"Ответить: `{question_counter}. ответ`",
+        f"📨 *Вопрос #{question_counter}*\nОт: {username} (`{message.chat.id}`)\nТекст: {message.text}",
         parse_mode='Markdown'
     )
     
     bot.send_message(message.chat.id, f"✅ Вопрос #{question_counter} отправлен!")
     question_counter += 1
-    save_data()
 
 # ===== АДМИН-МЕНЮ =====
 @bot.message_handler(commands=['admin'])
@@ -96,129 +113,198 @@ def admin_menu(message):
     
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(
-        types.KeyboardButton('📋 Активные вопросы'),
-        types.KeyboardButton('📊 История ответов'),
-        types.KeyboardButton('🔄 Обновить')
+        types.KeyboardButton('📋 Вопросы'),
+        types.KeyboardButton('💬 Активные чаты'),
+        types.KeyboardButton('📊 Забанены')
     )
-    bot.send_message(
-        ADMIN_ID,
-        "🛠 *Панель администратора*\nВыберите действие:",
-        parse_mode='Markdown',
-        reply_markup=markup
-    )
+    bot.send_message(ADMIN_ID, "🛠 Админ-панель:", reply_markup=markup)
 
-@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID and m.text in ['📋 Активные вопросы', '📊 История ответов', '🔄 Обновить'])
-def handle_admin_buttons(message):
-    if message.text == '📋 Активные вопросы':
-        show_active_questions(message)
-    elif message.text == '📊 История ответов':
-        show_answered_history(message)
-    elif message.text == '🔄 Обновить':
-        admin_menu(message)
+@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID and m.text in ['📋 Вопросы', '💬 Активные чаты', '📊 Забанены'])
+def handle_admin_menu(message):
+    if message.text == '📋 Вопросы':
+        show_questions(message)
+    elif message.text == '💬 Активные чаты':
+        show_active_chats(message)
+    elif message.text == '📊 Забанены':
+        show_banned(message)
 
-def show_active_questions(message):
-    if not questions:
-        bot.send_message(ADMIN_ID, "📭 Активных вопросов нет")
-        return
-    
-    text = "📋 *Активные вопросы:*\n\n"
+def show_questions(message):
+    text = "📋 *Вопросы:*\n\n"
     for num, q in sorted(questions.items()):
-        text += f"*{num}.* {q['username']}\n"
-        text += f"   Время: {q['asked_time']}\n"
-        text += f"   Текст: {q['text'][:50]}...\n"
-        text += f"   Ответить: `{num}. ваш ответ`\n\n"
+        if q['type'] == 'question':
+            text += f"*{num}.* {q['username']}: {q['text'][:50]}...\n"
+            text += f"Ответить: `{num}. текст`\n\n"
+    
+    if text == "📋 *Вопросы:*\n\n":
+        text = "📭 Вопросов нет"
     
     bot.send_message(ADMIN_ID, text, parse_mode='Markdown')
 
-def show_answered_history(message):
-    if not answered:
-        bot.send_message(ADMIN_ID, "📭 История ответов пуста")
+def show_active_chats(message):
+    if not active_chats:
+        bot.send_message(ADMIN_ID, "💭 Нет активных переписок")
         return
     
-    text = "📊 *История ответов:*\n\n"
-    for i, q in enumerate(reversed(answered[-20:]), 1):  # Последние 20
-        status = "✅" if q['answered'] else "❌"
-        answer_time = q['answered_time'] if q['answered_time'] else "—"
-        answer_text = q['answer_text'][:50] + "..." if q['answer_text'] else "Нет ответа"
-        
-        text += f"{status} *Вопрос #{q['number']}*\n"
-        text += f"От: {q['username']}\n"
-        text += f"Задан: {q['asked_time']}\n"
-        text += f"Ответ: {answer_time}\n"
-        text += f"Текст: {q['text'][:50]}...\n"
-        text += f"Ответил: {answer_text}\n"
-        text += "━━━━━━━━━━━━━━\n"
+    text = "💬 *Активные чаты:*\n\n"
+    for user_id, data in active_chats.items():
+        text += f"👤 {data['username']} (`{user_id}`)\n"
+        text += f"Написать: `msg_{user_id} текст`\n"
+        text += f"Завершить: `/stop {user_id}`\n\n"
     
     bot.send_message(ADMIN_ID, text, parse_mode='Markdown')
 
-# ===== ОТВЕТЫ АДМИНА =====
-@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID and m.text and '.' in m.text)
-def handle_admin_answer(message):
-    text = message.text.strip()
+def show_banned(message):
+    if not banned_users:
+        bot.send_message(ADMIN_ID, "✅ Нет заблокированных")
+        return
     
-    # Проверяем формат: "1. ответ"
-    if text[0].isdigit() and '.' in text:
-        parts = text.split('.', 1)
-        
-        if len(parts) == 2 and parts[0].strip().isdigit():
-            num = int(parts[0].strip())
-            answer_text = parts[1].strip()
-            
-            if num in questions:
-                q = questions[num]
-                answer_time = datetime.now().strftime("%d.%m %H:%M")
-                
-                # Обновляем данные вопроса
-                q['answered'] = True
-                q['answer_text'] = answer_text
-                q['answered_time'] = answer_time
-                
-                # Перемещаем в историю
-                answered.append(q.copy())
-                del questions[num]
-                save_data()
-                
-                # Отправляем ответ пользователю
-                try:
-                    bot.send_message(
-                        q['user_id'],
-                        f"📩 *Ответ администратора*\n\n"
-                        f"Ваш вопрос: {q['text']}\n\n"
-                        f"Ответ: {answer_text}\n"
-                        f"Время ответа: {answer_time}",
-                        parse_mode='Markdown'
-                    )
-                    user_msg = f"✅ Ответ #{num} отправлен {q['username']}"
-                except:
-                    user_msg = f"⚠️ Ответ #{num} сохранен, но не отправлен (пользователь заблокировал бота)"
-                
-                # Уведомляем админа
-                bot.reply_to(message, user_msg)
-                
-                # Показываем обновленный список
-                show_active_questions(message)
-            else:
-                bot.reply_to(message, f"❌ Вопрос #{num} не найден")
+    text = "📊 *Забанены:*\n\n"
+    for user_id in banned_users:
+        text += f"`{user_id}`\n"
+    
+    bot.send_message(ADMIN_ID, text, parse_mode='Markdown')
 
-# ===== КОМАНДА /LIST =====
-@bot.message_handler(commands=['list'])
-def quick_list(message):
+# ===== ОБРАБОТКА ЗАПРОСОВ ПЕРЕПИСКИ =====
+@bot.callback_query_handler(func=lambda call: call.data.startswith('accept_'))
+def accept_chat(call):
+    num = int(call.data.split('_')[1])
+    
+    if num not in questions:
+        bot.answer_callback_query(call.id, "Запрос устарел")
+        return
+    
+    q = questions[num]
+    del questions[num]
+    
+    # Запускаем переписку
+    active_chats[q['user_id']] = {
+        'admin_id': ADMIN_ID,
+        'username': q['username'],
+        'last_activity': datetime.now()
+    }
+    
+    bot.edit_message_text(
+        f"✅ Вы в переписке с {q['username']}\n\nНапишите что-нибудь...",
+        call.message.chat.id,
+        call.message.message_id
+    )
+    
+    bot.send_message(
+        q['user_id'],
+        "✅ Администратор принял ваш запрос! Можете общаться напрямую."
+    )
+
+# ===== ПЕРЕСЫЛКА СООБЩЕНИЙ =====
+@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID and m.text.startswith('msg_'))
+def admin_to_user(message):
+    """Админ пишет: msg_123456789 текст"""
+    parts = message.text.split(' ', 1)
+    if len(parts) < 2:
+        return
+    
+    user_id_str = parts[0].replace('msg_', '')
+    if not user_id_str.isdigit():
+        return
+    
+    user_id = int(user_id_str)
+    text = parts[1]
+    
+    if user_id in active_chats:
+        try:
+            bot.send_message(user_id, f"👨‍💼 *Админ:* {text}", parse_mode='Markdown')
+            active_chats[user_id]['last_activity'] = datetime.now()
+            bot.reply_to(message, f"→ {text}")
+        except:
+            bot.reply_to(message, "❌ Не удалось отправить")
+    else:
+        bot.reply_to(message, "❌ Чат не активен")
+
+@bot.message_handler(func=lambda m: m.from_user.id in active_chats and m.chat.id != ADMIN_ID)
+def user_to_admin(message):
+    """Пользователь в активной переписке"""
+    user_id = message.from_user.id
+    chat_data = active_chats.get(user_id)
+    
+    if chat_data:
+        username = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+        bot.send_message(
+            ADMIN_ID,
+            f"👤 *{username}:* {message.text}",
+            parse_mode='Markdown'
+        )
+        active_chats[user_id]['last_activity'] = datetime.now()
+
+# ===== КОМАНДЫ АДМИНА =====
+@bot.message_handler(commands=['ban', 'unban', 'stop'])
+def admin_commands(message):
     if message.chat.id != ADMIN_ID:
         return
     
-    if not questions:
-        bot.send_message(ADMIN_ID, "📭 Активных вопросов нет")
+    if not message.text or len(message.text.split()) < 2:
+        bot.send_message(ADMIN_ID, "Используйте: `/ban 123456789`", parse_mode='Markdown')
         return
     
-    text = "📋 *Быстрый список:*\n\n"
-    for num, q in sorted(questions.items()):
-        text += f"`{num}. ` — {q['username']}: {q['text'][:40]}...\n"
+    cmd = message.text.split()[0]
+    target = message.text.split()[1]
     
-    bot.send_message(ADMIN_ID, text, parse_mode='Markdown')
+    try:
+        # Пробуем извлечь ID из текста вида "123456789" или "@username"
+        if target.startswith('@'):
+            # Для бана по нику нужен другой подход (здесь упрощенно)
+            bot.send_message(ADMIN_ID, "❌ Укажите ID пользователя")
+            return
+        
+        target_id = int(target)
+        
+        if target_id == ADMIN_ID:
+            bot.send_message(ADMIN_ID, "❌ Нельзя забанить себя")
+            return
+        
+        if cmd == '/ban':
+            banned_users.add(target_id)
+            bot.send_message(ADMIN_ID, f"✅ Забанен `{target_id}`")
+        elif cmd == '/unban':
+            banned_users.discard(target_id)
+            bot.send_message(ADMIN_ID, f"✅ Разбанен `{target_id}`")
+        elif cmd == '/stop':
+            if target_id in active_chats:
+                username = active_chats[target_id]['username']
+                del active_chats[target_id]
+                bot.send_message(ADMIN_ID, f"⏹ Чат с {username} завершен")
+                bot.send_message(target_id, "⏹ Переписка завершена администратором")
+            else:
+                bot.send_message(ADMIN_ID, "❌ Чат не активен")
+                
+    except ValueError:
+        bot.send_message(ADMIN_ID, "❌ Неверный формат")
+
+# ===== ОТВЕТЫ НА ВОПРОСЫ =====
+@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID and m.text and m.text[0].isdigit() and '.' in m.text)
+def answer_question(message):
+    parts = message.text.split('.', 1)
+    if len(parts) != 2:
+        return
+    
+    try:
+        num = int(parts[0].strip())
+        answer = parts[1].strip()
+        
+        if num in questions and questions[num]['type'] == 'question':
+            q = questions[num]
+            
+            try:
+                bot.send_message(q['user_id'], f"📩 *Ответ:* {answer}", parse_mode='Markdown')
+                bot.reply_to(message, f"✅ Отправлено {q['username']}")
+                del questions[num]
+            except:
+                bot.reply_to(message, f"❌ Не удалось отправить")
+        else:
+            bot.reply_to(message, f"❌ Вопрос не найден")
+            
+    except:
+        pass
 
 # ===== ЗАПУСК =====
 if __name__ == '__main__':
     print(f"🤖 Бот запущен. Админ: {ADMIN_ID}")
-    print(f"📊 Активных вопросов: {len(questions)}")
-    print(f"📈 Отвеченных: {len(answered)}")
     bot.polling(none_stop=True)
