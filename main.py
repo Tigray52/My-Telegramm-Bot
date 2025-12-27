@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from telebot import types
 
 bot = telebot.TeleBot(os.getenv('BOT_TOKEN'))
-ADMIN_ID = 6337781618
+ADMIN_ID = 8392885071
 
 # Хранилище данных
 class Storage:
