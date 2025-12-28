@@ -17,7 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-API_TOKEN = 'ВАШ_ТОКЕН_ОТ_BOTFATHER'
+API_TOKEN = 'BOT_TOKEN''
 
 # Структуры данных
 waiting_queue = []
